@@ -1,5 +1,6 @@
 "use client";
-import React, { useState, useEffect } from "react";
+
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useSearchParams } from "next/navigation";
@@ -8,73 +9,25 @@ const TicTacToe = () => {
   const [board, setBoard] = useState(Array(9).fill(""));
   const [gameId, setGameId] = useState<string | null>(null);
   const [playerSymbol, setPlayerSymbol] = useState<string>("");
-  const [wsConnection, setWsConnection] = useState<WebSocket | null>(null);
   const [isMyTurn, setIsMyTurn] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
   const searchParams = useSearchParams();
 
-  useEffect(() => {
-    const id = searchParams.get("game");
-    if (id) {
-      joinGame(id);
-    } else {
-      createGame();
-    }
-  }, []);
+  const initWebSocket = useCallback((id: string, symbol: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-  useEffect(() => {
-    if (gameId && playerSymbol) {
-      initWebSocket(gameId);
-    }
-    return () => {
-      if (wsConnection) {
-        wsConnection.close();
-      }
-    };
-  }, [gameId, playerSymbol]);
-
-  const createGame = async () => {
-    try {
-      const response = await fetch("http://localhost:8080/game/create", {
-        method: "POST",
-      });
-      const data = await response.json();
-      setGameId(data.gameId);
-      setPlayerSymbol("X");
-      setIsMyTurn(true);
-      initWebSocket(data.gameId);
-    } catch (error) {
-      console.error("Error creating game:", error);
-    }
-  };
-
-  const joinGame = async (id: string) => {
-    try {
-      const response = await fetch(`http://localhost:8080/game/join/${id}`, {
-        method: "POST",
-      });
-      if (response.ok) {
-        setGameId(id);
-        setPlayerSymbol("O");
-        initWebSocket(id);
-      }
-    } catch (error) {
-      console.error("Error joining game:", error);
-    }
-  };
-
-  const initWebSocket = (id: string) => {
     const ws = new WebSocket(`ws://localhost:8080/ws/${id}`);
+    wsRef.current = ws;
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      console.log("Received message:", data); // Debug log
-      console.log("Player Symbol:", playerSymbol); // Debug log
-      console.log("Next Player:", data.nextPlayer); // Debug log
-
+      console.log("Received data:", data, "My symbol:", symbol);
       setBoard(data.board);
-      if (playerSymbol) {
-        setIsMyTurn(data.nextPlayer === playerSymbol);
-        console.log("Is my turn:", data.nextPlayer === playerSymbol); // Debug log
+
+      if (data.type === "MOVE") {
+        const nextTurn = data.nextPlayer === symbol;
+        console.log("Setting turn to:", nextTurn);
+        setIsMyTurn(nextTurn);
       }
 
       if (data.type === "GAME_OVER") {
@@ -83,20 +36,59 @@ const TicTacToe = () => {
     };
 
     ws.onopen = () => {
-      console.log("WebSocket connected, player symbol:", playerSymbol); // Debug log
+      console.log("WebSocket connected for player:", symbol);
+    };
+  }, []);
+
+  useEffect(() => {
+    const id = searchParams.get("game");
+
+    const setupGame = async () => {
+      try {
+        if (id) {
+          const response = await fetch(
+            `http://localhost:8080/game/join/${id}`,
+            {
+              method: "POST",
+            },
+          );
+          if (response.ok) {
+            setGameId(id);
+            const symbol = "O";
+            setPlayerSymbol(symbol);
+            setIsMyTurn(false);
+            initWebSocket(id, symbol);
+          }
+        } else {
+          const response = await fetch("http://localhost:8080/game/create", {
+            method: "POST",
+          });
+          const data = await response.json();
+          setGameId(data.gameId);
+          const symbol = "X";
+          setPlayerSymbol(symbol);
+          setIsMyTurn(true);
+          initWebSocket(data.gameId, symbol);
+        }
+      } catch (error) {
+        console.error("Game setup error:", error);
+      }
     };
 
-    ws.onerror = (error) => {
-      console.error("WebSocket error:", error);
-    };
+    setupGame();
 
-    setWsConnection(ws);
-  };
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [searchParams, initWebSocket]);
 
   const handleClick = (index: number) => {
-    if (!isMyTurn || board[index] || !wsConnection) return;
+    if (!isMyTurn || board[index] || !wsRef.current || !gameId) return;
 
-    wsConnection.send(
+    wsRef.current.send(
       JSON.stringify({
         type: "MOVE",
         position: index,
@@ -111,6 +103,7 @@ const TicTacToe = () => {
       variant="outline"
       className="h-20 w-20 text-2xl font-bold"
       onClick={() => handleClick(index)}
+      disabled={!isMyTurn || !!board[index]}
     >
       {board[index]}
     </Button>
@@ -134,7 +127,9 @@ const TicTacToe = () => {
         </div>
         {gameId && (
           <div className="mt-4 text-center">
-            <p className="text-sm text-gray-500 mb-2">Game ID: {gameId}</p>
+            <p className="text-sm text-gray-500 mb-2">
+              You are playing as: {playerSymbol}
+            </p>
             <p className="text-sm text-gray-500">Share this link to play:</p>
             <code className="block mt-2 p-2 bg-gray-100 rounded text-sm">
               {shareableLink}
