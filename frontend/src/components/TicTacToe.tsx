@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useSearchParams } from "next/navigation";
@@ -13,45 +13,42 @@ const TicTacToe = () => {
   const wsRef = useRef<WebSocket | null>(null);
   const searchParams = useSearchParams();
 
-  const initWebSocket = useCallback((id: string, symbol: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-
-    const ws = new WebSocket(`ws://localhost:8080/ws/${id}`);
-    wsRef.current = ws;
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      console.log("Received data:", data, "My symbol:", symbol);
-      setBoard(data.board);
-
-      if (data.type === "MOVE") {
-        const nextTurn = data.nextPlayer === symbol;
-        console.log("Setting turn to:", nextTurn);
-        setIsMyTurn(nextTurn);
-      }
-
-      if (data.type === "GAME_OVER") {
-        alert(data.winner ? `Player ${data.winner} wins!` : "It's a draw!");
-      }
-    };
-
-    ws.onopen = () => {
-      console.log("WebSocket connected for player:", symbol);
-    };
-  }, []);
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8080";
 
   useEffect(() => {
     const id = searchParams.get("game");
 
+    const initWebSocket = (id: string, symbol: string) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
+      const ws = new WebSocket(`${wsUrl}/ws/${id}`);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        setBoard(data.board);
+
+        if (data.type === "MOVE") {
+          setIsMyTurn(data.nextPlayer === symbol);
+        }
+
+        if (data.type === "GAME_OVER") {
+          alert(data.winner ? `Player ${data.winner} wins!` : "It's a draw!");
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+      };
+    };
+
     const setupGame = async () => {
       try {
         if (id) {
-          const response = await fetch(
-            `http://localhost:8080/game/join/${id}`,
-            {
-              method: "POST",
-            },
-          );
+          const response = await fetch(`${apiUrl}/game/join/${id}`, {
+            method: "POST",
+          });
           if (response.ok) {
             setGameId(id);
             const symbol = "O";
@@ -60,7 +57,7 @@ const TicTacToe = () => {
             initWebSocket(id, symbol);
           }
         } else {
-          const response = await fetch("http://localhost:8080/game/create", {
+          const response = await fetch(`${apiUrl}/game/create`, {
             method: "POST",
           });
           const data = await response.json();
@@ -83,7 +80,7 @@ const TicTacToe = () => {
         wsRef.current = null;
       }
     };
-  }, [searchParams, initWebSocket]);
+  }, [searchParams, apiUrl, wsUrl]);
 
   const handleClick = (index: number) => {
     if (!isMyTurn || board[index] || !wsRef.current || !gameId) return;
