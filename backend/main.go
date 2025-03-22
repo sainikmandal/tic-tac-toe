@@ -36,6 +36,8 @@ var (
 )
 
 func handleCreateGame(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
 	mu.Lock()
 	gameID := generateGameID()
 	games[gameID] = &Game{
@@ -44,12 +46,15 @@ func handleCreateGame(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Unlock()
 
+	log.Printf("Created new game: %s", gameID)
 	json.NewEncoder(w).Encode(map[string]string{
 		"gameId": gameID,
 	})
 }
 
 func handleJoinGame(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
 	vars := mux.Vars(r)
 	gameID := vars["id"]
 
@@ -62,12 +67,26 @@ func handleJoinGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Player joined game: %s", gameID)
 	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "joined",
+	})
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request, upgrader *websocket.Upgrader) {
 	vars := mux.Vars(r)
 	gameID := vars["id"]
+
+	// Check if game exists
+	mu.RLock()
+	game, exists := games[gameID]
+	mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Game not found", http.StatusNotFound)
+		return
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -75,22 +94,31 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, upgrader *websocket
 		return
 	}
 
+	// Add this connection to the game
 	mu.Lock()
 	connections[gameID] = append(connections[gameID], conn)
-	game := games[gameID]
 	mu.Unlock()
 
-	// Send initial game state
-	conn.WriteJSON(game)
+	log.Printf("WebSocket connection established for game: %s", gameID)
 
+	// Send initial game state
+	if err := conn.WriteJSON(game); err != nil {
+		log.Printf("Error sending initial state: %v", err)
+		removeConnection(gameID, conn)
+		return
+	}
+
+	// Handle incoming messages
 	for {
 		var move Move
 		err := conn.ReadJSON(&move)
 		if err != nil {
-			log.Printf("Read error: %v", err)
+			log.Printf("WebSocket read error: %v", err)
 			removeConnection(gameID, conn)
 			break
 		}
+
+		log.Printf("Received move: %+v", move)
 
 		if move.Type == "MOVE" {
 			makeMove(gameID, move.Position, move.Symbol)
@@ -103,7 +131,28 @@ func makeMove(gameID string, position int, symbol string) {
 	defer mu.Unlock()
 
 	game := games[gameID]
-	if game == nil || game.GameOver || position < 0 || position >= 9 || game.Board[position] != "" || symbol != game.NextPlayer {
+	if game == nil {
+		log.Printf("Game not found: %s", gameID)
+		return
+	}
+
+	if game.GameOver {
+		log.Printf("Game is already over")
+		return
+	}
+
+	if position < 0 || position >= 9 {
+		log.Printf("Invalid position: %d", position)
+		return
+	}
+
+	if game.Board[position] != "" {
+		log.Printf("Position already occupied: %d", position)
+		return
+	}
+
+	if symbol != game.NextPlayer {
+		log.Printf("Not player's turn. Expected %s, got %s", game.NextPlayer, symbol)
 		return
 	}
 
@@ -113,9 +162,11 @@ func makeMove(gameID string, position int, symbol string) {
 	if checkWin(game.Board) {
 		game.GameOver = true
 		game.Winner = symbol
+		log.Printf("Game %s won by %s", gameID, symbol)
 		broadcastGameState(gameID, "GAME_OVER")
 	} else if checkDraw(game.Board) {
 		game.GameOver = true
+		log.Printf("Game %s ended in a draw", gameID)
 		broadcastGameState(gameID, "GAME_OVER")
 	} else {
 		broadcastGameState(gameID, "MOVE")
@@ -123,7 +174,6 @@ func makeMove(gameID string, position int, symbol string) {
 }
 
 func generateGameID() string {
-	// Simple implementation - replace with more robust solution
 	return "game_" + randomString(6)
 }
 
@@ -149,14 +199,23 @@ func broadcastGameState(gameID string, messageType string) {
 		return
 	}
 
-	for _, conn := range connections[gameID] {
-		conn.WriteJSON(map[string]interface{}{
-			"type":       messageType,
-			"board":      game.Board,
-			"nextPlayer": game.NextPlayer,
-			"gameOver":   game.GameOver,
-			"winner":     game.Winner,
-		})
+	message := map[string]interface{}{
+		"type":       messageType,
+		"board":      game.Board,
+		"nextPlayer": game.NextPlayer,
+		"gameOver":   game.GameOver,
+		"winner":     game.Winner,
+	}
+
+	mu.RLock()
+	gameCons := connections[gameID]
+	mu.RUnlock()
+
+	for _, conn := range gameCons {
+		if err := conn.WriteJSON(message); err != nil {
+			log.Printf("Error broadcasting to client: %v", err)
+			removeConnection(gameID, conn)
+		}
 	}
 }
 
@@ -172,6 +231,8 @@ func removeConnection(gameID string, conn *websocket.Conn) {
 			}
 		}
 	}
+
+	conn.Close()
 }
 
 func checkWin(board []string) bool {
@@ -200,43 +261,69 @@ func checkDraw(board []string) bool {
 	return true
 }
 
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("OK"))
+}
+
 func main() {
-	rand.New(rand.NewSource(time.Now().UnixNano()))
+	// Seed the random number generator
+	rand.Seed(time.Now().UnixNano())
+
+	// Load environment variables
 	godotenv.Load()
+
+	// Debug environment variables
+	log.Printf("Environment variables:")
+	log.Printf("PORT: %s", os.Getenv("PORT"))
+	log.Printf("CORS_ORIGIN: %s", os.Getenv("CORS_ORIGIN"))
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
+	// Get allowed origins
 	corsOrigin := os.Getenv("CORS_ORIGIN")
 	if corsOrigin == "" {
 		corsOrigin = "http://localhost:3000"
 	}
 
+	// Enable verbose logging
+	log.Printf("Starting server with CORS origin: %s", corsOrigin)
+
 	r := mux.NewRouter()
 
+	// CORS setup with very permissive settings for debugging
 	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{corsOrigin},
+		AllowedOrigins:   []string{"*"}, // Allow all origins for now
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
 		AllowCredentials: true,
+		Debug:            true,
 	})
 
+	// WebSocket upgrader with relaxed origin check
 	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
-			return origin == corsOrigin
+			log.Printf("WebSocket connection attempt from: %s", origin)
+			return true // Allow all origins for now
 		},
 	}
 
+	// Routes
 	r.HandleFunc("/game/create", handleCreateGame).Methods("POST", "OPTIONS")
 	r.HandleFunc("/game/join/{id}", handleJoinGame).Methods("POST", "OPTIONS")
 	r.HandleFunc("/ws/{id}", func(w http.ResponseWriter, r *http.Request) {
 		handleWebSocket(w, r, &upgrader)
 	})
+	r.HandleFunc("/health", handleHealth).Methods("GET")
 
+	// Handler with CORS
 	handler := c.Handler(r)
+
 	log.Printf("Server starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
